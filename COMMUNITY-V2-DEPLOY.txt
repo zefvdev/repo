@@ -1,0 +1,28 @@
+mSign Community v2 deployment
+
+1. iOS
+Unzip this package and open unzip-drop.xcodeproj. The project uses the Sources filesystem-synchronized group, so the new Swift file is automatically included.
+
+2. VPS API
+Copy CommunityAPI/community.php into the same directory that serves members.php/conversations.php/messages.php.
+Run CommunityAPI/schema.sql against the existing mSign database.
+
+IMPORTANT: community.php contains one clearly marked community_auth() adapter. Replace its fallback api_sessions lookup with the exact authentication helper already used by account.php before exposing the endpoint publicly. Do not create a second token system.
+
+3. Suggested endpoint
+https://apii.zefv.dev/Msign-api/api/community.php
+
+4. Existing endpoints remain unchanged
+members.php
+conversations.php
+messages.php
+certificate_requests.php
+profile.php
+friends.php
+
+5. Roles
+member = normal community access
+developer = staff messaging + announcement publishing
+admin = developer access + audit log
+
+The server enforces these permissions. Client-side role gating is only UI convenience.
