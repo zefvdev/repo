@@ -35,11 +35,12 @@ int zsign(NSString *app,
           NSString *displayname,
           NSString *bundleversion,
           NSString *entitlementsFile,
-          bool dontGenerateEmbeddedMobileProvision
+          bool dontGenerateEmbeddedMobileProvision,
+          bool parallelSigning
           );
 
-// Toggle parallel DAG signing (independent frameworks/dylibs/plugins signed
-// concurrently). Call before zsign(). Off by default.
+// Legacy process-wide toggle retained for compatibility. New signing calls pass
+// their parallel flag directly, so concurrent local batch jobs do not race.
 void ZSignSetParallel(bool enabled);
 
 #ifdef __cplusplus

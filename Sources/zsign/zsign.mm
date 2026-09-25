@@ -141,7 +141,8 @@ int zsign(NSString *app,
 		  NSString *displayname,
 		  NSString *bundleversion,
 		  NSString *entitlementsFile,
-		  bool dontGenerateEmbeddedMobileProvision
+		  bool dontGenerateEmbeddedMobileProvision,
+		  bool parallelSigning
 		  )
 {
 	ZTimer gtimer;
@@ -149,6 +150,7 @@ int zsign(NSString *app,
 	bool bForce = false;
 	bool bWeakInject = false;
 	bool bDontGenerateEmbeddedMobileProvision = dontGenerateEmbeddedMobileProvision;
+	bool bParallelSigning = parallelSigning;
 	
 	string strCertFile;
 	string strPKeyFile;
@@ -213,7 +215,7 @@ int zsign(NSString *app,
 	
 	timer.Reset();
 	ZAppBundle bundle;
-	bool bRet = bundle.SignFolder(&zSignAsset, strFolder, strBundleId, strBundleVersion, strDisplayName, strDyLibFile, bForce, bWeakInject, bEnableCache, bDontGenerateEmbeddedMobileProvision);
+	bool bRet = bundle.SignFolder(&zSignAsset, strFolder, strBundleId, strBundleVersion, strDisplayName, strDyLibFile, bForce, bWeakInject, bEnableCache, bDontGenerateEmbeddedMobileProvision, bParallelSigning);
 	timer.PrintResult(bRet, ">>> Signed %s!", bRet ? "OK" : "Failed");
 	
 	gtimer.Print(">>> Done.");

@@ -19,6 +19,7 @@ ZAppBundle::ZAppBundle()
     m_pSignAsset = NULL;
     m_bForceSign = false;
     m_bWeakInject = false;
+    m_bParallel = false;
 }
 
 bool ZAppBundle::FindAppFolder(const string &strFolder, string &strAppFolder)
@@ -336,7 +337,7 @@ bool ZAppBundle::SignNode(JValue &jvNode)
         folders.reserve(nFolders);
         for (size_t i = 0; i < nFolders; i++) folders.push_back(&jvNode["folders"][i]);
 
-        if (g_bZSignParallel.load() && nFolders > 1)
+        if (m_bParallel && nFolders > 1)
         {
             std::atomic<bool> ok(true);
             std::atomic<bool> *okp = &ok;
@@ -364,7 +365,7 @@ bool ZAppBundle::SignNode(JValue &jvNode)
         files.reserve(nFiles);
         for (size_t i = 0; i < nFiles; i++) files.push_back(jvNode["files"][i].asCString());
 
-        if (g_bZSignParallel.load() && nFiles > 1)
+        if (m_bParallel && nFiles > 1)
         {
             std::atomic<bool> ok(true);
             std::atomic<bool> *okp = &ok;
@@ -529,12 +530,14 @@ bool ZAppBundle::SignFolder(ZSignAsset *pSignAsset,
                             bool bForce,
                             bool bWeakInject,
                             bool bEnableCache,
-                            bool dontGenerateEmbeddedMobileProvision
+                            bool dontGenerateEmbeddedMobileProvision,
+                            bool bParallel
                             )
 {
     m_bForceSign = bForce;
     m_pSignAsset = pSignAsset;
     m_bWeakInject = bWeakInject;
+    m_bParallel = bParallel;
     if (NULL == m_pSignAsset)
     {
         return false;
@@ -667,8 +670,19 @@ bool ZAppBundle::SignFolder(ZSignAsset *pSignAsset,
         }
     }
 
+    // Cache is scoped to the signing context. Reusing a changed-files tree
+    // across different certificates/profiles can skip required re-signing.
+    string strCacheContext = m_strAppFolder;
+    strCacheContext += "|team=" + m_pSignAsset->m_strTeamId;
+    strCacheContext += "|subject=" + m_pSignAsset->m_strSubjectCN;
+    strCacheContext += "|cert=" + m_pSignAsset->m_strCertificateFingerprint;
+    strCacheContext += "|prov=" + m_pSignAsset->m_strProvisionHash;
+    strCacheContext += "|ents=" + m_pSignAsset->m_strEntitlementsHash;
+    strCacheContext += "|bundle=" + strBundleID;
+    strCacheContext += "|version=" + strBundleVersion;
+    strCacheContext += "|display=" + strDisplayName;
     string strCacheName;
-    SHA1Text(m_strAppFolder, strCacheName);
+    SHA1Text(strCacheContext, strCacheName);
     if (!IsFileExistsV("./.zsign_cache/%s.json", strCacheName.c_str()))
     {
         m_bForceSign = true;

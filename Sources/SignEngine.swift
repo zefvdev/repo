@@ -8,6 +8,7 @@
 
 import Foundation
 import Darwin
+import CryptoKit
 import ZIPFoundation
 
 func xmlPlistData(fromMobileProvision data: Data) -> Data? {
@@ -56,7 +57,8 @@ nonisolated struct ZsignSigner {
         displayName: String? = nil,
         version: String? = nil,
         entitlementsPath: String? = nil,
-        skipEmbeddedProvision: Bool = false
+        skipEmbeddedProvision: Bool = false,
+        parallelSigning: Bool = true
     ) throws {
         let fm = FileManager.default
         for p in [appBundlePath, provisionPath, p12Path] where !fm.fileExists(atPath: p) {
@@ -72,7 +74,8 @@ nonisolated struct ZsignSigner {
             displayName ?? "",
             version ?? "",
             entitlementsPath ?? "",
-            true   // fork writes embedded.mobileprovision only inside `if(dontGenerate…)`; always embed
+            true,  // fork writes embedded.mobileprovision only inside `if(dontGenerate…)`; always embed
+            parallelSigning
         )
         if code != 0 { throw ZsignError.signingFailed(code: code) }
     }
@@ -158,6 +161,17 @@ protocol IPAArchiver {
     func pack(payloadRoot: URL, to ipa: URL) throws
 }
 
+nonisolated struct StagedSigningMaterial: Sendable {
+    let p12URL: URL
+    let provisionURL: URL
+}
+
+nonisolated enum SigningCompressionMode: String, Sendable {
+    case fast
+    case balanced
+    case maximum
+}
+
 nonisolated struct SignOutcome: Sendable {
     let ipaURL: URL          // file:// temp path of the signed IPA
     let name: String
@@ -227,6 +241,9 @@ nonisolated struct SignOptions: Sendable {
     var surgicalMode = true             // engine default; SigningSheet overrides to opt-in
     var parallelSigning = true          // engine default; SigningSheet overrides to opt-in and zsign still disables it for guarded cases
     var parallelSigningPayloadSizeBytes: Int64? = nil
+    /// Fast by default because IPA output is an intermediate signing artifact.
+    /// `.maximum` is available for users who prefer smaller archives.
+    var compressionMode: SigningCompressionMode = .fast
 
     static let none = SignOptions()
 
@@ -240,18 +257,36 @@ nonisolated struct SignOptions: Sendable {
     }
 }
 
+extension SignOptions {
+    nonisolated func performanceFingerprint() -> String {
+        var d = Data()
+        func add(_ s: String) { d.append(contentsOf: s.utf8); d.append(0) }
+        add(name ?? ""); add(bundleID ?? ""); add(version ?? "")
+        add(injectPath); add(injectFolder)
+        for x in injectDylibs { add(x.url.standardizedFileURL.path); add(x.weak ? "1" : "0") }
+        for x in removeDylibs.sorted() { add(x) }
+        for x in binaryPatches.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            add(x.label); add(String(x.fileOffset)); d.append(contentsOf: x.bytes); d.append(contentsOf: x.original); d.append(0)
+        }
+        if let blob = injectDataBlob { d.append(blob) }; d.append(0)
+        if let manifest = avx512BridgeManifest { d.append(manifest) }; d.append(0)
+        for k in plistSet.keys.sorted() { add(k); add(plistSet[k] ?? "") }
+        if let ents = entitlementsPlistData { d.append(ents) }; d.append(0)
+        add(forceMinIOS ?? "")
+        let bools = [disableFileSharing, forcePortrait, skipIPad, disableATS, stripSCInfo,
+                     stripPrivacyManifests, stripWatchApps, stripExtensions, removeURLSchemes,
+                     stripBitcode, stripDebugSymbols, autoFixEntitlements, disablePush,
+                     disableAppGroups, disableiCloud, disableSiri, disableBackgroundModes,
+                     skipEmbeddedProvision, surgicalMode, parallelSigning]
+        bools.forEach { add($0 ? "1" : "0") }
+        add(compressionMode.rawValue)
+        if let n = parallelSigningPayloadSizeBytes { add(String(n)) }
+        return SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 nonisolated enum Signer {
     static let parallelSigningMaxIPABytes: Int64 = 500 * 1_024 * 1_024
-
-    actor ZSignExecutionGate {
-        static let shared = ZSignExecutionGate()
-
-        func run<T: Sendable>(parallel: Bool, _ operation: () throws -> T) throws -> T {
-            ZSignSetParallel(parallel)
-            defer { ZSignSetParallel(false) }
-            return try operation()
-        }
-    }
 
     enum ParallelSigningDecision: Equatable {
         case enabled
@@ -378,18 +413,29 @@ nonisolated enum Signer {
         ipaURL: URL,
         material: CertMaterial,
         options o: SignOptions,
+        workspaceRoot: URL? = nil,
+        stagedMaterial: StagedSigningMaterial? = nil,
         onLog: (@Sendable (String) -> Void)? = nil
     ) async throws -> SignOutcome {
         let fm = FileManager.default
-        let work = fm.temporaryDirectory.appendingPathComponent("sign-\(UUID().uuidString)", isDirectory: true)
+        let root = workspaceRoot ?? fm.temporaryDirectory
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        let work = root.appendingPathComponent("job-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
 
-        // 1. Stage cert + profile — zsign takes file paths.
-        let p12URL  = work.appendingPathComponent("cert.p12")
-        let provURL = work.appendingPathComponent("profile.mobileprovision")
-        try material.p12.write(to: p12URL)
-        try material.provision.write(to: provURL)
+        // 1. Stage cert + profile once per batch when possible. They are read-only inputs.
+        let p12URL: URL
+        let provURL: URL
+        if let stagedMaterial {
+            p12URL = stagedMaterial.p12URL
+            provURL = stagedMaterial.provisionURL
+        } else {
+            p12URL  = work.appendingPathComponent("cert.p12")
+            provURL = work.appendingPathComponent("profile.mobileprovision")
+            try material.p12.write(to: p12URL, options: .atomic)
+            try material.provision.write(to: provURL, options: .atomic)
+        }
 
         // 2. Unzip → locate Payload/*.app
         let extractDir = work.appendingPathComponent("x", isDirectory: true)
@@ -424,19 +470,18 @@ nonisolated enum Signer {
                 entitlementsURL = nil
             }
 
-            try await ZSignExecutionGate.shared.run(parallel: parallelDecision.isEnabled) {
-                try ZsignSigner.signAppBundle(
-                    appBundlePath: appURL.path,
-                    provisionPath: provURL.path,
-                    p12Path: p12URL.path,
-                    p12Password: material.password,
-                    bundleID: o.bundleID,
-                    displayName: o.name,
-                    version: o.version,
-                    entitlementsPath: entitlementsURL?.path,
-                    skipEmbeddedProvision: o.skipEmbeddedProvision
-                )
-            }
+            ZsignSigner.signAppBundle(
+                appBundlePath: appURL.path,
+                provisionPath: provURL.path,
+                p12Path: p12URL.path,
+                p12Password: material.password,
+                bundleID: o.bundleID,
+                displayName: o.name,
+                version: o.version,
+                entitlementsPath: entitlementsURL?.path,
+                skipEmbeddedProvision: o.skipEmbeddedProvision,
+                parallelSigning: parallelDecision.isEnabled
+            )
             capture?.stop()
         } catch {
             capture?.stop()
@@ -472,7 +517,14 @@ nonisolated enum Signer {
             .appendingPathExtension("ipa")
         try? fm.removeItem(at: signed)
         onLog?(">>> Packaging signed IPA…")
-        try fm.zipItem(at: payload, to: signed, shouldKeepParent: true, compressionMethod: .none)
+        let compression: CompressionMethod = {
+            switch o.compressionMode {
+            case .fast: return .none
+            case .balanced: return .deflate
+            case .maximum: return .deflate
+            }
+        }()
+        try fm.zipItem(at: payload, to: signed, shouldKeepParent: true, compressionMethod: compression)
         onLog?(">>> Done.")
 
         let ents = Signer.readEntitlements(appURL: appURL)
