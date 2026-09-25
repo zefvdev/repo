@@ -20,9 +20,6 @@ public:
 	string m_strSubjectCN;
 	string m_strProvisionData;
 	string m_strEntitlementsData;
-	string m_strProvisionHash;
-	string m_strEntitlementsHash;
-	string m_strCertificateFingerprint;
 
 private:
 	void *m_evpPKey;

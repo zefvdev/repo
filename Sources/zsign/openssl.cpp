@@ -656,7 +656,6 @@ bool ZSignAsset::Init(const string &strSignerCertFile, const string &strSignerPK
 {
 	ReadFile(strProvisionFile.c_str(), m_strProvisionData);
 	ReadFile(strEntitlementsFile.c_str(), m_strEntitlementsData);
-	SHA1Text(m_strProvisionData, m_strProvisionHash);
 	if (m_strProvisionData.empty())
 	{
 		ZLog::Error(">>> Can't Find Provision File!\n");
@@ -675,12 +674,6 @@ bool ZSignAsset::Init(const string &strSignerCertFile, const string &strSignerPK
 				jvProv["Entitlements"].writePList(m_strEntitlementsData);
 			}
 		}
-	}
-
-	if (m_strEntitlementsData.empty()) {
-		m_strEntitlementsHash.clear();
-	} else {
-		SHA1Text(m_strEntitlementsData, m_strEntitlementsHash);
 	}
 
 	if (m_strTeamId.empty())
@@ -780,15 +773,6 @@ bool ZSignAsset::Init(const string &strSignerCertFile, const string &strSignerPK
 	{
 		ZLog::Error(">>> Can't Find Paired Certificate Subject Common Name!\n");
 		return false;
-	}
-
-	// Cache correctness: distinguish certificates even when their subject CN is the same.
-	unsigned char *certDER = NULL;
-	int certDERLen = i2d_X509(x509Cert, &certDER);
-	if (certDER != NULL && certDERLen > 0) {
-		string certData((const char *)certDER, (size_t)certDERLen);
-		SHA1Text(certData, m_strCertificateFingerprint);
-		OPENSSL_free(certDER);
 	}
 
 	m_evpPKey = evpPKey;

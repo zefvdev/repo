@@ -8,7 +8,6 @@
 
 import Foundation
 import Darwin
-import CryptoKit
 import ZIPFoundation
 
 func xmlPlistData(fromMobileProvision data: Data) -> Data? {
@@ -58,14 +57,14 @@ nonisolated struct ZsignSigner {
         version: String? = nil,
         entitlementsPath: String? = nil,
         skipEmbeddedProvision: Bool = false,
-        parallelSigning: Bool = true
+        parallel: Bool = false
     ) throws {
         let fm = FileManager.default
         for p in [appBundlePath, provisionPath, p12Path] where !fm.fileExists(atPath: p) {
             throw ZsignError.fileNotFound(p)
         }
 
-        let code = zsign(
+        let code = zsignWithOptions(
             appBundlePath,
             provisionPath,
             p12Path,
@@ -75,7 +74,7 @@ nonisolated struct ZsignSigner {
             version ?? "",
             entitlementsPath ?? "",
             true,  // fork writes embedded.mobileprovision only inside `if(dontGenerate…)`; always embed
-            parallelSigning
+            parallel
         )
         if code != 0 { throw ZsignError.signingFailed(code: code) }
     }
@@ -161,17 +160,6 @@ protocol IPAArchiver {
     func pack(payloadRoot: URL, to ipa: URL) throws
 }
 
-nonisolated struct StagedSigningMaterial: Sendable {
-    let p12URL: URL
-    let provisionURL: URL
-}
-
-nonisolated enum SigningCompressionMode: String, Sendable {
-    case fast
-    case balanced
-    case maximum
-}
-
 nonisolated struct SignOutcome: Sendable {
     let ipaURL: URL          // file:// temp path of the signed IPA
     let name: String
@@ -179,6 +167,20 @@ nonisolated struct SignOutcome: Sendable {
     let version: String
     var entitlements: [String: String] = [:]
     var sizeBytes: Int64 = 0
+}
+
+nonisolated struct SignPerformance: Sendable {
+    let extractionSeconds: Double
+    let signingSeconds: Double
+    let packagingSeconds: Double
+    let totalSeconds: Double
+}
+
+nonisolated struct BulkSignResult: Sendable {
+    let index: Int
+    let input: URL
+    let outcome: Result<SignOutcome, String>
+    let elapsedSeconds: Double
 }
 
 /// A raw byte edit to the app's main Mach-O, resolved from a virtual address.
@@ -241,9 +243,6 @@ nonisolated struct SignOptions: Sendable {
     var surgicalMode = true             // engine default; SigningSheet overrides to opt-in
     var parallelSigning = true          // engine default; SigningSheet overrides to opt-in and zsign still disables it for guarded cases
     var parallelSigningPayloadSizeBytes: Int64? = nil
-    /// Fast by default because IPA output is an intermediate signing artifact.
-    /// `.maximum` is available for users who prefer smaller archives.
-    var compressionMode: SigningCompressionMode = .fast
 
     static let none = SignOptions()
 
@@ -254,34 +253,6 @@ nonisolated struct SignOptions: Sendable {
         && !stripSCInfo && !stripPrivacyManifests && !stripWatchApps && !stripExtensions && !removeURLSchemes
         && !stripBitcode && !stripDebugSymbols
         && !autoFixEntitlements && !disablePush && !disableAppGroups && !disableiCloud && !disableSiri && !disableBackgroundModes
-    }
-}
-
-extension SignOptions {
-    nonisolated func performanceFingerprint() -> String {
-        var d = Data()
-        func add(_ s: String) { d.append(contentsOf: s.utf8); d.append(0) }
-        add(name ?? ""); add(bundleID ?? ""); add(version ?? "")
-        add(injectPath); add(injectFolder)
-        for x in injectDylibs { add(x.url.standardizedFileURL.path); add(x.weak ? "1" : "0") }
-        for x in removeDylibs.sorted() { add(x) }
-        for x in binaryPatches.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            add(x.label); add(String(x.fileOffset)); d.append(contentsOf: x.bytes); d.append(contentsOf: x.original); d.append(0)
-        }
-        if let blob = injectDataBlob { d.append(blob) }; d.append(0)
-        if let manifest = avx512BridgeManifest { d.append(manifest) }; d.append(0)
-        for k in plistSet.keys.sorted() { add(k); add(plistSet[k] ?? "") }
-        if let ents = entitlementsPlistData { d.append(ents) }; d.append(0)
-        add(forceMinIOS ?? "")
-        let bools = [disableFileSharing, forcePortrait, skipIPad, disableATS, stripSCInfo,
-                     stripPrivacyManifests, stripWatchApps, stripExtensions, removeURLSchemes,
-                     stripBitcode, stripDebugSymbols, autoFixEntitlements, disablePush,
-                     disableAppGroups, disableiCloud, disableSiri, disableBackgroundModes,
-                     skipEmbeddedProvision, surgicalMode, parallelSigning]
-        bools.forEach { add($0 ? "1" : "0") }
-        add(compressionMode.rawValue)
-        if let n = parallelSigningPayloadSizeBytes { add(String(n)) }
-        return SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -413,35 +384,29 @@ nonisolated enum Signer {
         ipaURL: URL,
         material: CertMaterial,
         options o: SignOptions,
-        workspaceRoot: URL? = nil,
-        stagedMaterial: StagedSigningMaterial? = nil,
-        onLog: (@Sendable (String) -> Void)? = nil
+        onLog: (@Sendable (String) -> Void)? = nil,
+        captureOutput: Bool = true
     ) async throws -> SignOutcome {
         let fm = FileManager.default
-        let root = workspaceRoot ?? fm.temporaryDirectory
-        try fm.createDirectory(at: root, withIntermediateDirectories: true)
-        let work = root.appendingPathComponent("job-\(UUID().uuidString)", isDirectory: true)
+        let totalStart = ContinuousClock.now
+        var signingSeconds: Double = 0
+        let work = fm.temporaryDirectory.appendingPathComponent("sign-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
 
-        // 1. Stage cert + profile once per batch when possible. They are read-only inputs.
-        let p12URL: URL
-        let provURL: URL
-        if let stagedMaterial {
-            p12URL = stagedMaterial.p12URL
-            provURL = stagedMaterial.provisionURL
-        } else {
-            p12URL  = work.appendingPathComponent("cert.p12")
-            provURL = work.appendingPathComponent("profile.mobileprovision")
-            try material.p12.write(to: p12URL, options: .atomic)
-            try material.provision.write(to: provURL, options: .atomic)
-        }
+        // 1. Stage cert + profile — zsign takes file paths.
+        let p12URL  = work.appendingPathComponent("cert.p12")
+        let provURL = work.appendingPathComponent("profile.mobileprovision")
+        try material.p12.write(to: p12URL)
+        try material.provision.write(to: provURL)
 
         // 2. Unzip → locate Payload/*.app
         let extractDir = work.appendingPathComponent("x", isDirectory: true)
         try fm.createDirectory(at: extractDir, withIntermediateDirectories: true)
         onLog?(">>> Extracting IPA…")
+        let extractionStart = ContinuousClock.now
         try fm.unzipItem(at: ipaURL, to: extractDir)
+        let extractionSeconds = Double(extractionStart.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(extractionStart.duration(to: ContinuousClock.now).components.seconds)
         let payload = extractDir.appendingPathComponent("Payload", isDirectory: true)
         guard let appURL = try fm.contentsOfDirectory(at: payload, includingPropertiesForKeys: nil)
             .first(where: { $0.pathExtension == "app" }) else {
@@ -452,9 +417,13 @@ nonisolated enum Signer {
         try applyPreSign(appURL: appURL, options: o, onLog: onLog)
 
         // 3. Sign in place — capture the engine's real stdout, mSign-style.
-        let capture = onLog.map { ConsoleCapture($0) }
+        // stdout capture redirects the process-wide file descriptor, so it is
+        // intentionally disabled for concurrent bulk jobs. Single-job signing
+        // keeps the existing captured console behavior.
+        let capture = captureOutput ? onLog.map { ConsoleCapture($0) } : nil
         capture?.start()
         do {
+            let signingStart = ContinuousClock.now
             let parallelDecision = parallelSigningDecision(
                 options: o,
                 payloadSizeBytes: o.parallelSigningPayloadSizeBytes
@@ -470,7 +439,7 @@ nonisolated enum Signer {
                 entitlementsURL = nil
             }
 
-            ZsignSigner.signAppBundle(
+            try ZsignSigner.signAppBundle(
                 appBundlePath: appURL.path,
                 provisionPath: provURL.path,
                 p12Path: p12URL.path,
@@ -480,9 +449,10 @@ nonisolated enum Signer {
                 version: o.version,
                 entitlementsPath: entitlementsURL?.path,
                 skipEmbeddedProvision: o.skipEmbeddedProvision,
-                parallelSigning: parallelDecision.isEnabled
+                parallel: parallelDecision.isEnabled
             )
             capture?.stop()
+            signingSeconds = Double(signingStart.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(signingStart.duration(to: ContinuousClock.now).components.seconds)
         } catch {
             capture?.stop()
             throw error
@@ -517,19 +487,88 @@ nonisolated enum Signer {
             .appendingPathExtension("ipa")
         try? fm.removeItem(at: signed)
         onLog?(">>> Packaging signed IPA…")
-        let compression: CompressionMethod = {
-            switch o.compressionMode {
-            case .fast: return .none
-            case .balanced: return .deflate
-            case .maximum: return .deflate
-            }
-        }()
-        try fm.zipItem(at: payload, to: signed, shouldKeepParent: true, compressionMethod: compression)
+        let packagingStart = ContinuousClock.now
+        try fm.zipItem(at: payload, to: signed, shouldKeepParent: true, compressionMethod: .none)
+        let packagingSeconds = Double(packagingStart.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(packagingStart.duration(to: ContinuousClock.now).components.seconds)
+        let totalSeconds = Double(totalStart.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(totalStart.duration(to: ContinuousClock.now).components.seconds)
+        onLog?(String(format: ">>> Turbo timing: extract %.2fs · sign %.2fs · package %.2fs · total %.2fs", extractionSeconds, signingSeconds, packagingSeconds, totalSeconds))
         onLog?(">>> Done.")
 
         let ents = Signer.readEntitlements(appURL: appURL)
         let sz = (try? fm.attributesOfItem(atPath: signed.path)[.size] as? Int64) ?? 0
-        return SignOutcome(ipaURL: signed, name: name, bundleID: bundleID, version: version, entitlements: ents, sizeBytes: sz)
+        return SignOutcome(ipaURL: signed, name: name, bundleID: bundleID, version: version, entitlements: ents, sizeBytes: sz, performance: SignPerformance(extractionSeconds: extractionSeconds, signingSeconds: signingSeconds, packagingSeconds: packagingSeconds, totalSeconds: totalSeconds))
+    }
+
+    // MARK: - Turbo local bulk signing
+
+    /// Returns a conservative worker count that leaves room for zsign's own
+    /// intra-bundle parallelism and the iOS UI. The system scheduler remains in
+    /// charge of actual core placement; we never pin threads to CPU cores.
+    nonisolated static func recommendedBulkConcurrency(parallelSigning: Bool = true) -> Int {
+        let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let thermal = ProcessInfo.processInfo.thermalState
+        if thermal == .serious || thermal == .critical { return 1 }
+        if !parallelSigning { return min(cores, 4) }
+        return max(1, min(3, cores / 2))
+    }
+
+    /// Signs multiple IPAs locally with bounded concurrency. Every job gets an
+    /// independent ZAppBundle instance, so jobs no longer serialize behind the
+    /// old process-global ZSignSetParallel switch. Results are returned in input
+    /// order; a failed IPA does not cancel the rest of the batch.
+    nonisolated static func signBatch(
+        ipaURLs: [URL],
+        material: CertMaterial,
+        options: SignOptions,
+        maxConcurrency: Int? = nil,
+        onProgress: (@Sendable (Int, Int, BulkSignResult) -> Void)? = nil,
+        onLog: (@Sendable (String) -> Void)? = nil
+    ) async -> [BulkSignResult] {
+        guard !ipaURLs.isEmpty else { return [] }
+        let limit = max(1, min(maxConcurrency ?? recommendedBulkConcurrency(parallelSigning: options.parallelSigning), ipaURLs.count))
+        let state = BulkProgressState(total: ipaURLs.count)
+        var results = Array<BulkSignResult?>(repeating: nil, count: ipaURLs.count)
+        await withTaskGroup(of: BulkSignResult.self) { group in
+            var next = 0
+            for _ in 0..<limit {
+                guard next < ipaURLs.count else { break }
+                let index = next; let url = ipaURLs[index]; next += 1
+                group.addTask(priority: .userInitiated) {
+                    let start = ContinuousClock.now
+                    do {
+                        let outcome = try await signDetached(ipaURL: url, material: material, options: options, onLog: onLog, captureOutput: false)
+                        return BulkSignResult(index: index, input: url, outcome: .success(outcome), elapsedSeconds: Double(start.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(start.duration(to: ContinuousClock.now).components.seconds))
+                    } catch {
+                        return BulkSignResult(index: index, input: url, outcome: .failure(error.localizedDescription), elapsedSeconds: Double(start.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(start.duration(to: ContinuousClock.now).components.seconds))
+                    }
+                }
+            }
+            while let result = await group.next() {
+                results[result.index] = result
+                let completed = await state.increment()
+                onProgress?(completed, ipaURLs.count, result)
+                if next < ipaURLs.count {
+                    let index = next; let url = ipaURLs[index]; next += 1
+                    group.addTask(priority: .userInitiated) {
+                        let start = ContinuousClock.now
+                        do {
+                            let outcome = try await signDetached(ipaURL: url, material: material, options: options, onLog: onLog, captureOutput: false)
+                            return BulkSignResult(index: index, input: url, outcome: .success(outcome), elapsedSeconds: Double(start.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(start.duration(to: ContinuousClock.now).components.seconds))
+                        } catch {
+                            return BulkSignResult(index: index, input: url, outcome: .failure(error.localizedDescription), elapsedSeconds: Double(start.duration(to: ContinuousClock.now).components.attoseconds) / 1e18 + Double(start.duration(to: ContinuousClock.now).components.seconds))
+                        }
+                    }
+                }
+            }
+        }
+        return results.compactMap { $0 }
+    }
+
+    private actor BulkProgressState {
+        let total: Int
+        var completed = 0
+        init(total: Int) { self.total = total }
+        func increment() -> Int { completed += 1; return completed }
     }
 
     /// Best-effort entitlements read from the signed app's embedded profile.

@@ -134,23 +134,34 @@ bool ChangeDylibPath(NSString *filePath, NSString *oldPath, NSString *newPath) {
 
 
 int zsign(NSString *app,
-		  NSString *prov,
-		  NSString *key,
-		  NSString *pass,
-		  NSString *bundleid,
-		  NSString *displayname,
-		  NSString *bundleversion,
-		  NSString *entitlementsFile,
-		  bool dontGenerateEmbeddedMobileProvision,
-		  bool parallelSigning
-		  )
+          NSString *prov,
+          NSString *key,
+          NSString *pass,
+          NSString *bundleid,
+          NSString *displayname,
+          NSString *bundleversion,
+          NSString *entitlementsFile,
+          bool dontGenerateEmbeddedMobileProvision)
+{
+    return zsignWithOptions(app, prov, key, pass, bundleid, displayname, bundleversion, entitlementsFile, dontGenerateEmbeddedMobileProvision, false);
+}
+
+int zsignWithOptions(NSString *app,
+          NSString *prov,
+          NSString *key,
+          NSString *pass,
+          NSString *bundleid,
+          NSString *displayname,
+          NSString *bundleversion,
+          NSString *entitlementsFile,
+          bool dontGenerateEmbeddedMobileProvision,
+          bool parallel)
 {
 	ZTimer gtimer;
 	
 	bool bForce = false;
 	bool bWeakInject = false;
 	bool bDontGenerateEmbeddedMobileProvision = dontGenerateEmbeddedMobileProvision;
-	bool bParallelSigning = parallelSigning;
 	
 	string strCertFile;
 	string strPKeyFile;
@@ -215,7 +226,7 @@ int zsign(NSString *app,
 	
 	timer.Reset();
 	ZAppBundle bundle;
-	bool bRet = bundle.SignFolder(&zSignAsset, strFolder, strBundleId, strBundleVersion, strDisplayName, strDyLibFile, bForce, bWeakInject, bEnableCache, bDontGenerateEmbeddedMobileProvision, bParallelSigning);
+	bool bRet = bundle.SignFolder(&zSignAsset, strFolder, strBundleId, strBundleVersion, strDisplayName, strDyLibFile, bForce, bWeakInject, bEnableCache, bDontGenerateEmbeddedMobileProvision, parallel);
 	timer.PrintResult(bRet, ">>> Signed %s!", bRet ? "OK" : "Failed");
 	
 	gtimer.Print(">>> Done.");

@@ -35,13 +35,22 @@ int zsign(NSString *app,
           NSString *displayname,
           NSString *bundleversion,
           NSString *entitlementsFile,
-          bool dontGenerateEmbeddedMobileProvision,
-          bool parallelSigning
+          bool dontGenerateEmbeddedMobileProvision
           );
 
-// Legacy process-wide toggle retained for compatibility. New signing calls pass
-// their parallel flag directly, so concurrent local batch jobs do not race.
-void ZSignSetParallel(bool enabled);
+// Per-invocation variant. Parallelism is attached to the ZAppBundle instance
+// so multiple local signing jobs can run concurrently without racing on a
+// process-global parallel flag.
+int zsignWithOptions(NSString *app,
+                     NSString *prov,
+                     NSString *key,
+                     NSString *pass,
+                     NSString *bundleid,
+                     NSString *displayname,
+                     NSString *bundleversion,
+                     NSString *entitlementsFile,
+                     bool dontGenerateEmbeddedMobileProvision,
+                     bool parallel);
 
 #ifdef __cplusplus
 }

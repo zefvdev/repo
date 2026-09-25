@@ -4,15 +4,8 @@
 #include "sys/types.h"
 #include "common/base64.h"
 #include "common/common.h"
-#include <atomic>
 #include <vector>
 #include <dispatch/dispatch.h>
-
-// Parallel DAG signing toggle (set from Swift via ZSignSetParallel). When on,
-// SignNode signs independent sibling nodes/files concurrently; the parent seal
-// still runs after the join, preserving the code-signing dependency order.
-static std::atomic<bool> g_bZSignParallel{false};
-extern "C" void ZSignSetParallel(bool enabled) { g_bZSignParallel.store(enabled); }
 
 ZAppBundle::ZAppBundle()
 {
@@ -670,19 +663,8 @@ bool ZAppBundle::SignFolder(ZSignAsset *pSignAsset,
         }
     }
 
-    // Cache is scoped to the signing context. Reusing a changed-files tree
-    // across different certificates/profiles can skip required re-signing.
-    string strCacheContext = m_strAppFolder;
-    strCacheContext += "|team=" + m_pSignAsset->m_strTeamId;
-    strCacheContext += "|subject=" + m_pSignAsset->m_strSubjectCN;
-    strCacheContext += "|cert=" + m_pSignAsset->m_strCertificateFingerprint;
-    strCacheContext += "|prov=" + m_pSignAsset->m_strProvisionHash;
-    strCacheContext += "|ents=" + m_pSignAsset->m_strEntitlementsHash;
-    strCacheContext += "|bundle=" + strBundleID;
-    strCacheContext += "|version=" + strBundleVersion;
-    strCacheContext += "|display=" + strDisplayName;
     string strCacheName;
-    SHA1Text(strCacheContext, strCacheName);
+    SHA1Text(m_strAppFolder, strCacheName);
     if (!IsFileExistsV("./.zsign_cache/%s.json", strCacheName.c_str()))
     {
         m_bForceSign = true;

@@ -88,11 +88,7 @@ struct SigningSheet: View {
     @State private var result: SignedEntry?
     @State private var avx512DylibURL: URL?
     @State private var installing = false
-    @State private var showBulkPicker = false
-    @State private var bulkSigning = false
-    @State private var bulkCompleted = 0
-    @State private var bulkTotal = 0
-    @State private var bulkStatus: String?
+    @State private var showBulkSigning = false
 
     private let blue = Color(red: 0.25, green: 0.55, blue: 1.0)
     private let accent = Color(red: 0.25, green: 0.55, blue: 1.0)      // same blue as the reference layout
@@ -141,21 +137,6 @@ struct SigningSheet: View {
                         )
                     }
                     dylibInjection
-                    if let bulkStatus {
-                        HStack(spacing: 10) {
-                            Image(systemName: bulkSigning ? "bolt.horizontal.circle.fill" : "checkmark.circle.fill")
-                                .foregroundStyle(bulkSigning ? accent : success)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(bulkSigning ? "Bulk signing \(bulkCompleted)/\(bulkTotal)" : "Bulk signing")
-                                    .font(.system(size: 12, weight: .bold))
-                                Text(bulkStatus).font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                        }
-                        .padding(12)
-                        .background(surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    }
                     changesSummary
                     if let error { Text(error).font(.caption).foregroundStyle(.orange).padding(.horizontal, 3) }
                     if ota.tracing { tracingCard }
@@ -168,6 +149,9 @@ struct SigningSheet: View {
             .safeAreaInset(edge: .bottom, spacing: 0) { signBar.floatingGlassBar(edge: .bottom) }
         }
         .background(Color.black.ignoresSafeArea())
+        .sheet(isPresented: $showBulkSigning) {
+            TurboBulkSigningView(defaultOptions: buildOptionsValue())
+        }
         .fullScreenCover(isPresented: $showTerminal) {
             SigningTerminalView(
                 appName: name, bundle: bundle, icon: iconPNG ?? meta.iconPNG,
@@ -266,12 +250,6 @@ struct SigningSheet: View {
                 }
             }
         }
-        .sheet(isPresented: $showBulkPicker) {
-            DocPicker(types: [UTType(filenameExtension: "ipa") ?? .data]) { urls in
-                showBulkPicker = false
-                startBulkSigning(urls)
-            }
-        }
     }
 
     // MARK: Title
@@ -288,6 +266,14 @@ struct SigningSheet: View {
                 }
             }
             Spacer(minLength: 0)
+            Button { showBulkSigning = true } label: {
+                Image(systemName: "square.stack.3d.up.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(accent.opacity(0.22))
+                    .clipShape(Circle())
+            }
             titleBarButton("xmark")
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -949,32 +935,16 @@ struct SigningSheet: View {
     // MARK: Sign bar
 
     private var signBar: some View {
-        HStack(spacing: 8) {
-            Button { Task { await sign() } } label: {
-                HStack(spacing: 7.5) {
-                    if signing { ProgressView().tint(.white) } else { Image(systemName: "signature").font(.system(size: 13.5, weight: .bold)) }
-                    Text(signing ? "Signing…" : "Sign IPA").font(.system(size: 13.5, weight: .bold))
-                }
-                .frame(maxWidth: .infinity).padding(.vertical, 16)
-                .background(certs.active == nil || macho?.encrypted == true || bulkSigning ? Theme.subtle : accent).foregroundStyle(.white)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        Button { Task { await sign() } } label: {
+            HStack(spacing: 7.5) {
+                if signing { ProgressView().tint(.white) } else { Image(systemName: "signature").font(.system(size: 13.5, weight: .bold)) }
+                Text(signing ? "Signing…" : "Sign IPA").font(.system(size: 13.5, weight: .bold))
             }
-            .disabled(signing || bulkSigning || certs.active == nil || macho?.encrypted == true)
-
-            Button { showBulkPicker = true } label: {
-                VStack(spacing: 3) {
-                    Image(systemName: bulkSigning ? "arrow.triangle.2.circlepath" : "square.stack.3d.up.fill")
-                        .font(.system(size: 16, weight: .bold))
-                    Text(bulkSigning ? "\(bulkCompleted)/\(bulkTotal)" : "Bulk")
-                        .font(.system(size: 10, weight: .bold))
-                }
-                .frame(width: 62).padding(.vertical, 10)
-                .background(certs.active == nil || bulkSigning ? Theme.subtle : accentTint)
-                .foregroundStyle(.white)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            }
-            .disabled(signing || bulkSigning || certs.active == nil)
+            .frame(maxWidth: .infinity).padding(.vertical, 16)
+            .background(certs.active == nil || macho?.encrypted == true ? Theme.subtle : accent).foregroundStyle(.white)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
+        .disabled(signing || certs.active == nil || macho?.encrypted == true)
         .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 4.5)
     }
 
@@ -1213,62 +1183,6 @@ struct SigningSheet: View {
             UINotificationFeedbackGenerator().notificationOccurred(.error)
         }
         signing = false
-    }
-
-    private func startBulkSigning(_ urls: [URL]) {
-        guard !urls.isEmpty, let material = try? certs.activeMaterial() else { return }
-        let unique = Array(Set(urls.map { $0.standardizedFileURL }))
-        guard !unique.isEmpty else { return }
-
-        bulkSigning = true
-        bulkCompleted = 0
-        bulkTotal = unique.count
-        bulkStatus = nil
-        log.append(">>> Bulk signing \(unique.count) IPAs locally")
-
-        let options = buildOptionsValue()
-        let jobs = unique.map { LocalBulkSignJob(ipaURL: $0, options: options) }
-        let workerCount = LocalBulkSignEngine.recommendedWorkerCount
-
-        Task.detached(priority: .userInitiated) {
-            let results = await LocalBulkSignEngine.sign(
-                jobs: jobs,
-                material: material,
-                maxConcurrent: workerCount,
-                onProgress: { completed, total, job, result in
-                    Task { @MainActor in
-                        bulkCompleted = completed
-                        bulkTotal = total
-                        if case .success(let outcome) = result.result {
-                            do {
-                                _ = try SignedStore.shared.add(outcome: outcome, icon: nil, certName: material.name)
-                                ZefvAccount.shared.recordSign()
-                            } catch {
-                                bulkStatus = "Could not save \(job.ipaURL.lastPathComponent): \(error.localizedDescription)"
-                            }
-                        }
-                    }
-                },
-                onLog: { line in
-                    Task { @MainActor in log.append(line) }
-                },
-                onStatistics: { stats in
-                    Task { @MainActor in
-                        let elapsed = String(format: "%.1fs", stats.elapsed)
-                        bulkStatus = "\(stats.completed)/\(stats.total) complete · \(stats.cacheHits) cache hits · \(stats.failures) failed · \(elapsed)"
-                    }
-                }
-            )
-
-            await MainActor.run {
-                let success = results.filter(\.succeeded).count
-                let failed = results.count - success
-                bulkSigning = false
-                bulkStatus = "Bulk finished: \(success) succeeded, \(failed) failed · \(workerCount) local workers"
-                log.append(">>> \(bulkStatus!)")
-                UINotificationFeedbackGenerator().notificationOccurred(failed == 0 ? .success : .warning)
-            }
-        }
     }
 
     private var sourceSizeBytes: Int64 {
@@ -2242,6 +2156,172 @@ private struct KeyValueEditorList: View {
         }
         .scrollContentBackground(.hidden)
         .background(Color.black)
+    }
+}
+
+
+// MARK: - Turbo local bulk signer
+
+private struct TurboBulkSigningView: View {
+    let defaultOptions: SignOptions
+    @Environment(\.dismiss) private var dismiss
+    @State private var showPicker = false
+    @State private var files: [URL] = []
+    @State private var running = false
+    @State private var completed = 0
+    @State private var results: [BulkSignResult] = []
+    @State private var log: [String] = []
+    @State private var error: String?
+
+    private var succeeded: Int { results.filter { if case .success = $0.outcome { return true }; return false }.count }
+    private var failed: Int { results.filter { if case .failure = $0.outcome { return true }; return false }.count }
+    private var totalTime: Double { results.reduce(0) { $0 + $1.elapsedSeconds } }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                VStack(spacing: 6) {
+                    Image(systemName: "speedometer")
+                        .font(.system(size: 30, weight: .bold))
+                        .foregroundStyle(.blue)
+                    Text("ZSign Turbo")
+                        .font(.title2.bold())
+                    Text("Local bulk signing · adaptive workers · per-job parallelism")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top, 10)
+
+                HStack(spacing: 10) {
+                    metric("Queued", "\(files.count)")
+                    metric("Done", "\(completed)")
+                    metric("Failed", "\(failed)")
+                    metric("Workers", "\(Signer.recommendedBulkConcurrency(parallelSigning: defaultOptions.parallelSigning))")
+                }
+
+                Button {
+                    showPicker = true
+                } label: {
+                    Label(files.isEmpty ? "Choose IPAs" : "Add IPAs", systemImage: "plus.app")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(running)
+
+                if !files.isEmpty {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(files.enumerated()), id: \.offset) { index, url in
+                                HStack {
+                                    Image(systemName: "doc.zipper")
+                                    Text(url.lastPathComponent).lineLimit(1)
+                                    Spacer()
+                                    Text("#\(index + 1)").font(.caption2.monospaced()).foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(Color.white.opacity(0.06))
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    }
+                }
+
+                if running {
+                    ProgressView(value: Double(completed), total: Double(max(files.count, 1)))
+                    Text("Signing \(completed) / \(files.count)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !results.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Results").font(.headline)
+                        Text("\(succeeded) succeeded · \(failed) failed · aggregate job time \(String(format: "%.2f", totalTime))s")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if let error {
+                    Text(error).font(.caption).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Spacer()
+
+                Button {
+                    start()
+                } label: {
+                    Label(running ? "Signing…" : "Sign All Locally", systemImage: "bolt.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(files.isEmpty || running)
+            }
+            .padding(16)
+            .navigationTitle("Bulk Sign")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { dismiss() }
+                        .disabled(running)
+                }
+            }
+            .sheet(isPresented: $showPicker) {
+                DocPicker(types: [UTType(filenameExtension: "ipa") ?? .data]) { urls in
+                    let incoming = urls.filter { $0.pathExtension.lowercased() == "ipa" }
+                    let existing = Set(files.map(\.standardizedFileURL))
+                    files.append(contentsOf: incoming.filter { !existing.contains($0.standardizedFileURL) })
+                }
+            }
+        }
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        VStack(spacing: 3) {
+            Text(value).font(.headline.monospacedDigit())
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func start() {
+        guard !running else { return }
+        guard let material = try? CertificateStore.shared.activeMaterial() else {
+            error = "No active certificate."
+            return
+        }
+        running = true
+        completed = 0
+        results = []
+        error = nil
+        var options = defaultOptions
+        options.parallelSigning = true
+        let batchFiles = files
+
+        Task.detached(priority: .userInitiated) {
+            let batch = await Signer.signBatch(
+                ipaURLs: batchFiles,
+                material: material,
+                options: options,
+                onProgress: { done, _, _ in
+                    Task { @MainActor in completed = done }
+                },
+                onLog: { line in
+                    Task { @MainActor in log.append(line) }
+                }
+            )
+            await MainActor.run {
+                results = batch.sorted { $0.index < $1.index }
+                completed = batch.count
+                running = false
+            }
+        }
     }
 }
 
